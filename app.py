@@ -1,6 +1,6 @@
 # streamlit_app.py
-# Replace your existing streamlit app with this file (full replacement).
-# NOTE: uses ttl=3600 (no underscores in numeric literal)
+# Full replacement — fixes "unhashable type: 'Series'" and other robustness issues.
+# Drop this into your repo, overwrite the old file, redeploy.
 
 import streamlit as st
 import traceback
@@ -13,8 +13,8 @@ import matplotlib.pyplot as plt
 import io
 import json
 
-st.set_page_config(page_title="Backtest (debug-friendly)", layout="wide")
-st.title("Backtest (debug-friendly) — Drop-in replacement")
+st.set_page_config(page_title="Backtest (fixed)", layout="wide")
+st.title("Backtest (fixed) — Drop-in replacement")
 
 # -------------------------
 # Sidebar diagnostics (safe)
@@ -100,7 +100,7 @@ def compute_max_drawdown(equity_series: pd.Series) -> float:
     dd = (peak - equity_series) / peak
     return float(dd.max())
 
-# Core backtest (defensive)
+# Core backtest (defensive, keys are strings)
 def run_backtest_core(df: pd.DataFrame,
                       initial_capital: float,
                       pos_stop_pct: float,
@@ -110,28 +110,33 @@ def run_backtest_core(df: pd.DataFrame,
                       entry_threshold: float):
     try:
         cash = initial_capital
-        positions = []
+        positions = []  # list of dicts: entry_date (date), entry_price (float), shares (int), stop_price (float)
         equity_points = []
         trades = []
-        monthly_realized = {}
+        monthly_realized = {}      # keys are month strings like "2025-09"
         month_start_equity = {}
         shutdown_info = {"happened": False, "date": None, "reason": None}
 
         df2 = df.copy()
+        # we'll compute prior_ret on Close
         df2["prior_ret"] = df2["Close"].pct_change().shift(1)
-        df2["month"] = df2.index.to_period("M")
 
         for idx, row in df2.iterrows():
+            # idx is a Timestamp
             today_open = float(row["Open"])
             today_close = float(row["Close"])
             today_date = idx.date()
-            today_month = row["month"]
+            # **IMPORTANT**: use string month key to avoid unhashable/Series issues
+            today_month_str = str(idx.to_period("M"))  # e.g. '2025-09'
 
-            if today_month not in monthly_realized:
-                monthly_realized[today_month] = 0.0
-                month_start_equity[today_month] = cash + sum([p["shares"] * today_close for p in positions])
+            # init month bookkeeping when first encountered
+            if today_month_str not in monthly_realized:
+                monthly_realized[today_month_str] = 0.0
+                month_start_equity[today_month_str] = cash + sum([p["shares"] * today_close for p in positions])
 
             realized_today = 0.0
+
+            # check existing positions for stop or time exit
             intraday_low = min(today_open, today_close)
             remaining_positions = []
             for pos in positions:
@@ -152,41 +157,49 @@ def run_backtest_core(df: pd.DataFrame,
                     trades.append({
                         "entry_date": pos["entry_date"].isoformat(),
                         "exit_date": today_date.isoformat(),
-                        "entry_price": pos["entry_price"],
-                        "exit_price": exit_price,
-                        "shares": pos["shares"],
-                        "pnl": pnl,
+                        "entry_price": float(pos["entry_price"]),
+                        "exit_price": float(exit_price),
+                        "shares": int(pos["shares"]),
+                        "pnl": float(pnl),
                         "reason": reason
                     })
                 else:
                     remaining_positions.append(pos)
             positions = remaining_positions
-            monthly_realized[today_month] += realized_today
+            monthly_realized[today_month_str] += realized_today
 
+            # equity before new entries
             equity = cash + sum([p["shares"] * today_close for p in positions])
-            eq_hist = [pt["equity"] for pt in equity_points] + [equity]
-            running_dd = compute_max_drawdown(pd.Series(eq_hist)) if eq_hist else 0.0
+            # compute running drawdown using previous equity points plus current equity
+            prev_eqs = [pt["equity"] for pt in equity_points]
+            eq_hist = pd.Series(prev_eqs + [equity]) if prev_eqs else pd.Series([equity])
+            running_dd = compute_max_drawdown(eq_hist)
 
-            paused_for_month = monthly_realized[today_month] >= (month_start_equity[today_month] * monthly_target_pct)
+            # monthly pause
+            paused_for_month = monthly_realized[today_month_str] >= (month_start_equity[today_month_str] * monthly_target_pct)
 
+            # entry signal: prior day return > threshold
             signal = False
             pr = row["prior_ret"]
             if (not paused_for_month) and (pd.notna(pr) and pr > entry_threshold):
                 signal = True
 
             if signal:
+                # sizing: risk_amount = equity * pos_stop_pct
                 risk_amount = equity * pos_stop_pct
                 stop_price = today_open * (1.0 - pos_stop_pct)
                 stop_distance = max(1e-6, today_open - stop_price)
                 shares = int(risk_amount // stop_distance)
                 if shares > 0 and shares * today_open <= cash:
+                    # worst-case if stop triggers immediately
                     worst_equity_if_stop = cash - (shares * today_open) + (shares * stop_price) + sum([p["shares"] * today_close for p in positions])
                     allowed_min_equity = initial_capital * (1.0 - overall_dd_pct)
                     if worst_equity_if_stop < allowed_min_equity:
+                        # skip entry to avoid breaching overall drawdown
                         trades.append({
                             "entry_date": today_date.isoformat(),
                             "exit_date": None,
-                            "entry_price": today_open,
+                            "entry_price": float(today_open),
                             "exit_price": None,
                             "shares": 0,
                             "pnl": 0.0,
@@ -196,17 +209,20 @@ def run_backtest_core(df: pd.DataFrame,
                         cash -= shares * today_open
                         positions.append({
                             "entry_date": today_date,
-                            "entry_price": today_open,
-                            "shares": shares,
-                            "stop_price": stop_price
+                            "entry_price": float(today_open),
+                            "shares": int(shares),
+                            "stop_price": float(stop_price)
                         })
 
+            # after possibly entering, compute worst-case intraday across all positions
+            intraday_low_for_check = intraday_low
             worst_equity = cash + sum([
-                (pos["stop_price"] if pos["stop_price"] < intraday_low else today_close) * pos["shares"]
+                (pos["stop_price"] if pos["stop_price"] < intraday_low_for_check else today_close) * pos["shares"]
                 for pos in positions
             ])
             allowed_min_equity = initial_capital * (1.0 - overall_dd_pct)
             if worst_equity < allowed_min_equity:
+                # emergency close all at close
                 for pos in positions:
                     exit_price = today_close
                     pnl = (exit_price - pos["entry_price"]) * pos["shares"]
@@ -214,14 +230,15 @@ def run_backtest_core(df: pd.DataFrame,
                     trades.append({
                         "entry_date": pos["entry_date"].isoformat(),
                         "exit_date": today_date.isoformat(),
-                        "entry_price": pos["entry_price"],
-                        "exit_price": exit_price,
-                        "shares": pos["shares"],
-                        "pnl": pnl,
+                        "entry_price": float(pos["entry_price"]),
+                        "exit_price": float(exit_price),
+                        "shares": int(pos["shares"]),
+                        "pnl": float(pnl),
                         "reason": "emergency_close_to_protect_overall_drawdown"
                     })
                 positions = []
                 equity = cash
+                # if still below allowed min, shutdown permanently
                 if equity < allowed_min_equity:
                     shutdown_info["happened"] = True
                     shutdown_info["date"] = today_date.isoformat()
@@ -229,9 +246,11 @@ def run_backtest_core(df: pd.DataFrame,
                     equity_points.append({"date": idx.isoformat(), "equity": float(equity)})
                     break
 
+            # record equity at day's close
             equity = cash + sum([p["shares"] * today_close for p in positions])
             equity_points.append({"date": idx.isoformat(), "equity": float(equity)})
 
+        # finalize
         equity_df = pd.DataFrame(equity_points)
         trades_df = pd.DataFrame(trades)
 
@@ -245,12 +264,12 @@ def run_backtest_core(df: pd.DataFrame,
             max_profit = 0.0
 
         report = {
-            "initial_capital": initial_capital,
-            "final_equity": final_equity,
-            "total_return_pct": (final_equity / initial_capital - 1.0) * 100.0,
-            "max_drawdown_pct": max_dd,
-            "max_profit_abs": max_profit,
-            "trades_count": len(trades_df),
+            "initial_capital": float(initial_capital),
+            "final_equity": float(final_equity),
+            "total_return_pct": float((final_equity / initial_capital - 1.0) * 100.0),
+            "max_drawdown_pct": float(max_dd),
+            "max_profit_abs": float(max_profit),
+            "trades_count": int(len(trades_df)),
             "shutdown": shutdown_info
         }
 
@@ -280,7 +299,7 @@ if run_btn:
         st.text(traceback.format_exc())
         st.stop()
 
-    with st.spinner("Running backtest (safe mode)..."):
+    with st.spinner("Running backtest (fixed)..."):
         res = run_backtest_core(df,
                                 initial_capital=float(initial_capital),
                                 pos_stop_pct=float(pos_stop_pct),
